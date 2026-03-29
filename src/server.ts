@@ -467,6 +467,51 @@ function isIdentChar(ch: string | undefined): boolean {
 }
 
 type ImportedSymbol = SymbolView & { __path: string };
+type StdModuleSymbolSpec = {
+	name: string;
+	signature: string;
+	kind: SymbolView['kind'];
+	doc?: string | null;
+	parameter_names?: string[];
+};
+
+const STD_MODULE_EXPORTS: Record<string, StdModuleSymbolSpec[]> = {
+	'std/io': [
+		{ name: 'writeln', signature: 'fn writeln(value)', kind: 'function', parameter_names: ['value'] },
+		{ name: 'write', signature: 'fn write(value)', kind: 'function', parameter_names: ['value'] },
+		{ name: 'println', signature: 'fn println(value)', kind: 'function', parameter_names: ['value'] },
+		{ name: 'print', signature: 'fn print(value)', kind: 'function', parameter_names: ['value'] },
+	],
+	'std/fs': [
+		{ name: 'readFile', signature: 'fn readFile(path) -> string, error', kind: 'function', parameter_names: ['path'] },
+		{ name: 'writeFile', signature: 'fn writeFile(path, content) -> nil, error', kind: 'function', parameter_names: ['path', 'content'] },
+		{ name: 'readDirectory', signature: 'fn readDirectory(path) -> [string], error', kind: 'function', parameter_names: ['path'] },
+		{ name: 'exists', signature: 'fn exists(path) -> bool', kind: 'function', parameter_names: ['path'] },
+		{ name: 'ReadFileError', signature: 'error ReadFileError', kind: 'error_tag' },
+		{ name: 'WriteFileError', signature: 'error WriteFileError', kind: 'error_tag' },
+		{ name: 'ReadDirectoryError', signature: 'error ReadDirectoryError', kind: 'error_tag' },
+	],
+	'std/env': [
+		{ name: 'get', signature: 'fn get(name) -> string', kind: 'function', parameter_names: ['name'] },
+	],
+	'std/path': [
+		{ name: 'join', signature: 'fn join(a, b)', kind: 'function', parameter_names: ['a', 'b'] },
+		{ name: 'basename', signature: 'fn basename(path)', kind: 'function', parameter_names: ['path'] },
+		{ name: 'dirname', signature: 'fn dirname(path)', kind: 'function', parameter_names: ['path'] },
+		{ name: 'extname', signature: 'fn extname(path)', kind: 'function', parameter_names: ['path'] },
+	],
+	'std/process': [
+		{ name: 'args', signature: 'fn args() -> [string]', kind: 'function', parameter_names: [] },
+		{ name: 'id', signature: 'fn id() -> int', kind: 'function', parameter_names: [] },
+		{ name: 'exit', signature: 'fn exit(code)', kind: 'function', parameter_names: ['code'] },
+	],
+	'std/os': [
+		{ name: 'cwd', signature: 'fn cwd() -> string, error', kind: 'function', parameter_names: [] },
+		{ name: 'name', signature: 'fn name() -> string', kind: 'function', parameter_names: [] },
+		{ name: 'arch', signature: 'fn arch() -> string', kind: 'function', parameter_names: [] },
+		{ name: 'CwdError', signature: 'error CwdError', kind: 'error_tag' },
+	],
+};
 
 async function resolveImportedMemberSymbol(
 	document: TextDocumentModel,
@@ -493,13 +538,8 @@ async function getImportedModuleSymbols(document: TextDocumentModel, symbol: Sym
 	const importPath = symbol.import_path;
 	if (!importPath) return null;
 
-	if (importPath === 'std/io') {
-		const builtins = [
-			{ name: 'writeln', signature: 'fn writeln(value)', kind: 'function' as const },
-			{ name: 'write', signature: 'fn write(value)', kind: 'function' as const },
-			{ name: 'println', signature: 'fn println(value)', kind: 'function' as const },
-			{ name: 'print', signature: 'fn print(value)', kind: 'function' as const },
-		].map((item, index) => ({
+	if (STD_MODULE_EXPORTS[importPath]) {
+		const builtins = STD_MODULE_EXPORTS[importPath].map((item, index) => ({
 			id: -100 - index,
 			name: item.name,
 			kind: item.kind,
@@ -508,11 +548,11 @@ async function getImportedModuleSymbols(document: TextDocumentModel, symbol: Sym
 			span: { start: 0, end: 0 },
 			visibility: 'public' as const,
 			signature: item.signature,
-			doc: null,
-			parameter_names: ['value'],
+			doc: item.doc ?? null,
+			parameter_names: item.parameter_names ?? null,
 			import_path: null,
 		})) as ImportedSymbolList;
-		builtins.__path = 'std/io';
+		builtins.__path = importPath;
 		return builtins;
 	}
 
@@ -539,7 +579,7 @@ async function getOrAnalyzePath(filePath: string): Promise<AnalysisReport> {
 }
 
 function resolveImportSpecifier(specifier: string, containingFilePath: string): string | null {
-	if (specifier === 'std/io') return 'std/io';
+	if (STD_MODULE_EXPORTS[specifier]) return specifier;
 	if (path.isAbsolute(specifier)) return pickExistingImportPath(specifier);
 
 	const baseDir = path.dirname(containingFilePath);
