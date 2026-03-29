@@ -16,6 +16,7 @@ import {
 	ReferenceParams,
 	ProposedFeatures,
 	Range,
+	TextEdit,
 	SignatureHelp,
 	SignatureHelpParams,
 	SignatureInformation,
@@ -37,6 +38,15 @@ import type { AnalysisReport, ButterDiagnostic, Span, SymbolView } from './types
 
 const connection = createConnection(ProposedFeatures.all);
 const documents = new TextDocuments(TextDocumentModel);
+const COMPLETION_TRIGGER_CHARACTERS = ['.', '_', ...'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ'];
+const STDLIB_AUTO_IMPORTS: Record<string, string> = {
+	io: 'std/io',
+	fs: 'std/fs',
+	env: 'std/env',
+	path: 'std/path',
+	process: 'std/process',
+	os: 'std/os',
+};
 
 let analyzerPath = process.env.BUTTER_ANALYZER || 'butter-analyzer';
 const analysisCache = new Map<string, AnalysisReport>();
@@ -56,7 +66,7 @@ connection.onInitialize((params: InitializeParams): InitializeResult => {
 			documentSymbolProvider: true,
 			referencesProvider: true,
 			completionProvider: {
-				triggerCharacters: ['.'],
+				triggerCharacters: COMPLETION_TRIGGER_CHARACTERS,
 			},
 			signatureHelpProvider: {
 				triggerCharacters: ['(', ','],
@@ -168,50 +178,67 @@ connection.onCompletion(async (params: CompletionParams): Promise<CompletionItem
 
 	let report = await getOrAnalyze(document);
 	const offset = document.offsetAt(params.position);
+	report = await getInteractiveReadyAnalysis(document, offset, report);
 	const memberContext = findMemberAccessContext(document.getText(), offset);
 
 	if (memberContext) {
 		let objectSymbol = findVisibleSymbolByName(report, memberContext.objectName, memberContext.objectSpan.start);
 		if (!objectSymbol) {
-			report = await getCompletionReadyAnalysis(document, offset, report);
-			objectSymbol = findVisibleSymbolByName(report, memberContext.objectName, memberContext.objectSpan.start);
+			const importPath = STDLIB_AUTO_IMPORTS[memberContext.objectName];
+			if (!importPath) return [];
+			const exportedSymbols = stdModuleSymbols(importPath);
+			if (!exportedSymbols) return [];
+			return exportedSymbols
+				.filter((symbol) => symbol.visibility === 'public')
+				.filter((symbol) => symbol.name.startsWith(memberContext.memberPrefix))
+				.map((symbol) => toCompletionItem(symbol, document, {
+					alias: memberContext.objectName,
+					importPath,
+				}));
 		}
-		if (!objectSymbol) return [];
 		const exportedSymbols = await getImportedModuleSymbols(document, objectSymbol);
 		if (!exportedSymbols) return [];
 
 		return exportedSymbols
 			.filter((symbol) => symbol.visibility === 'public')
 			.filter((symbol) => symbol.name.startsWith(memberContext.memberPrefix))
-			.map(toCompletionItem);
+			.map((symbol) => toCompletionItem(symbol));
 	}
 
-	return getVisibleSymbols(report, offset).map(toCompletionItem);
+	const prefix = currentIdentifierPrefix(document.getText(), offset);
+	const items = getCompletionSymbols(report, offset, prefix).map((symbol) => toCompletionItem(symbol));
+	for (const [alias, importPath] of Object.entries(STDLIB_AUTO_IMPORTS)) {
+		if (prefix.length === 0 || !alias.startsWith(prefix)) continue;
+		if (findVisibleSymbolByName(report, alias, offset)) continue;
+		items.push(makeStdlibAliasCompletion(alias, importPath, document));
+	}
+	return items;
 });
 
 connection.onSignatureHelp(async (params: SignatureHelpParams): Promise<SignatureHelp | null> => {
 	const document = documents.get(params.textDocument.uri);
 	if (!document) return null;
 
-	const report = await getOrAnalyze(document);
+	const initialReport = await getOrAnalyze(document);
 	const offset = document.offsetAt(params.position);
 	const context = findCallContext(document.getText(), offset);
 	if (!context) return null;
 
+	const report = await getInteractiveReadyAnalysis(document, offset, initialReport);
 	const target = await resolveCallable(document, report, context.calleeText, context.calleeOffset);
 	if (!target || !target.signature) return null;
 
-	const parameterNames = target.parameter_names ?? [];
+	const parameterInfos = buildParameterInfos(target.signature, target.parameter_names ?? []);
 	return {
 		signatures: [
 			SignatureInformation.create(
 				target.signature,
 				target.doc ? renderDoc(target.doc) : undefined,
-				...parameterNames.map((name) => ParameterInformation.create(name)),
+				...parameterInfos,
 			),
 		],
 		activeSignature: 0,
-		activeParameter: Math.min(context.activeParameter, Math.max(parameterNames.length - 1, 0)),
+		activeParameter: Math.min(context.activeParameter, Math.max(parameterInfos.length - 1, 0)),
 	};
 });
 
@@ -238,14 +265,14 @@ async function getOrAnalyze(document: TextDocumentModel): Promise<AnalysisReport
 	return report;
 }
 
-async function getCompletionReadyAnalysis(
+async function getInteractiveReadyAnalysis(
 	document: TextDocumentModel,
 	offset: number,
 	report: AnalysisReport,
 ): Promise<AnalysisReport> {
 	if (report.symbols.length > 0 || report.scopes.length > 0) return report;
 
-	const sanitized = sanitizeForCompletion(document.getText(), offset);
+	const sanitized = sanitizeForInteractive(document.getText(), offset);
 	if (!sanitized) return report;
 
 	try {
@@ -265,15 +292,59 @@ function findSymbolForOffset(report: AnalysisReport, offset: number): SymbolView
 	return report.symbols.find((symbol) => symbol.id === ref.symbol_id) ?? null;
 }
 
-function sanitizeForCompletion(text: string, offset: number): string | null {
-	const memberContext = findMemberAccessContext(text, offset);
-	if (!memberContext) return null;
+function sanitizeForInteractive(text: string, offset: number): string | null {
+	const prefix = text.slice(0, offset);
+	const memberContext = findMemberAccessContext(prefix, prefix.length);
+	if (memberContext) {
+		const placeholder = '__butter_complete__';
+		const beforeMember = prefix.slice(0, memberContext.memberSpan.start);
+		return `${beforeMember}${placeholder}${missingClosers(prefix)};`;
+	}
 
-	const placeholder = '__butter_complete__';
-	const beforeMember = text.slice(0, memberContext.memberSpan.start);
-	const afterMember = text.slice(memberContext.memberSpan.end);
-	const needsSemicolon = !afterMember.startsWith(';');
-	return `${beforeMember}${placeholder}${needsSemicolon ? ';' : ''}${afterMember}`;
+	if (findCallContext(prefix, prefix.length)) {
+		return `${prefix}${missingClosers(prefix)};`;
+	}
+
+	if (!prefix.trim()) return null;
+	return `${prefix}${missingClosers(prefix)};`;
+}
+
+function missingClosers(text: string): string {
+	let parens = 0;
+	let brackets = 0;
+	let braces = 0;
+	let inString = false;
+	let escaping = false;
+
+	for (const ch of text) {
+		if (inString) {
+			if (escaping) {
+				escaping = false;
+				continue;
+			}
+			if (ch === '\\') {
+				escaping = true;
+				continue;
+			}
+			if (ch === '"') {
+				inString = false;
+			}
+			continue;
+		}
+
+		if (ch === '"') {
+			inString = true;
+			continue;
+		}
+		if (ch === '(') parens += 1;
+		else if (ch === ')') parens = Math.max(0, parens - 1);
+		else if (ch === '[') brackets += 1;
+		else if (ch === ']') brackets = Math.max(0, brackets - 1);
+		else if (ch === '{') braces += 1;
+		else if (ch === '}') braces = Math.max(0, braces - 1);
+	}
+
+	return ')'.repeat(parens) + ']'.repeat(brackets) + '}'.repeat(braces);
 }
 
 function renderHover(symbol: SymbolView): string {
@@ -284,6 +355,61 @@ function renderHover(symbol: SymbolView): string {
 	}
 	parts.push(`\`\`\`butter\n${signature}\n\`\`\``);
 	return parts.join('\n\n');
+}
+
+function buildParameterInfos(signature: string, parameterNames: string[]): ParameterInformation[] {
+	const ranges = parameterLabelRanges(signature);
+	if (ranges.length > 0) {
+		return ranges.map((range, index) =>
+			ParameterInformation.create(
+				range,
+				parameterNames[index],
+			),
+		);
+	}
+
+	return parameterNames.map((name) => ParameterInformation.create(name));
+}
+
+function parameterLabelRanges(signature: string): Array<[number, number]> {
+	const open = signature.indexOf('(');
+	if (open < 0) return [];
+
+	let close = -1;
+	let bracketDepth = 0;
+	for (let i = open + 1; i < signature.length; i += 1) {
+		const ch = signature[i];
+		if (ch === '[') bracketDepth += 1;
+		else if (ch === ']') bracketDepth = Math.max(0, bracketDepth - 1);
+		else if (ch === ')' && bracketDepth === 0) {
+			close = i;
+			break;
+		}
+	}
+	if (close < 0 || close === open + 1) return [];
+
+	const ranges: Array<[number, number]> = [];
+	let start = open + 1;
+	let depth = 0;
+
+	for (let i = open + 1; i <= close; i += 1) {
+		const ch = signature[i];
+		if (ch === '[') depth += 1;
+		else if (ch === ']') depth = Math.max(0, depth - 1);
+
+		const atBoundary = i === close || (ch === ',' && depth === 0);
+		if (!atBoundary) continue;
+
+		let partEnd = i;
+		while (start < partEnd && signature[start] === ' ') start += 1;
+		while (partEnd > start && signature[partEnd - 1] === ' ') partEnd -= 1;
+		if (partEnd > start) {
+			ranges.push([start, partEnd]);
+		}
+		start = i + 1;
+	}
+
+	return ranges;
 }
 
 function renderHoverSignature(symbol: SymbolView): string {
@@ -352,13 +478,25 @@ function toDocumentSymbolKind(kind: SymbolView['kind']): SymbolKind {
 	}
 }
 
-function toCompletionItem(symbol: SymbolView): CompletionItem {
-	return {
+function toCompletionItem(
+	symbol: SymbolView,
+	document?: TextDocumentModel,
+	autoImport?: { alias: string; importPath: string },
+): CompletionItem {
+	const item: CompletionItem = {
 		label: symbol.name,
 		kind: toCompletionItemKind(symbol.kind),
 		detail: symbol.signature ?? renderSymbolDetail(symbol),
 		documentation: symbol.doc ? renderDoc(symbol.doc) : undefined,
+		filterText: symbol.name,
+		insertText: symbol.name,
 	};
+	if (document && autoImport) {
+		item.additionalTextEdits = buildStdlibImportEdit(document, autoImport.alias, autoImport.importPath);
+		item.detail = `${item.detail ?? ''} (auto-import ${autoImport.importPath})`.trim();
+		item.sortText = `0_${symbol.name}`;
+	}
+	return item;
 }
 
 function toCompletionItemKind(kind: SymbolView['kind']): CompletionItemKind {
@@ -408,6 +546,23 @@ function getVisibleSymbols(report: AnalysisReport, offset: number): SymbolView[]
 	return report.symbols.filter((symbol) => visibleScopeIds.has(symbol.scope_id));
 }
 
+function getCompletionSymbols(report: AnalysisReport, offset: number, prefix: string): SymbolView[] {
+	const visible = getVisibleSymbols(report, offset);
+	const seen = new Set<string>();
+	const filtered = prefix.length > 0
+		? visible.filter((symbol) => symbol.name.startsWith(prefix))
+		: visible;
+
+	const deduped: SymbolView[] = [];
+	for (const symbol of filtered) {
+		if (seen.has(symbol.name)) continue;
+		seen.add(symbol.name);
+		deduped.push(symbol);
+	}
+
+	return deduped;
+}
+
 function findVisibleSymbolByName(report: AnalysisReport, name: string, offset: number): SymbolView | null {
 	const scope = innermostScope(report, offset);
 	if (!scope) return report.symbols.find((symbol) => symbol.name === name) ?? null;
@@ -420,6 +575,24 @@ function findVisibleSymbolByName(report: AnalysisReport, name: string, offset: n
 	}
 
 	return report.symbols.find((symbol) => symbol.name === name && symbol.scope_id === 1) ?? null;
+}
+
+function currentIdentifierPrefix(text: string, offset: number): string {
+	let start = offset;
+	while (start > 0 && isIdentChar(text[start - 1])) start -= 1;
+	return text.slice(start, offset);
+}
+
+function makeStdlibAliasCompletion(alias: string, importPath: string, document: TextDocumentModel): CompletionItem {
+	return {
+		label: alias,
+		kind: CompletionItemKind.Module,
+		detail: `const ${alias} = import("${importPath}")`,
+		filterText: alias,
+		insertText: alias,
+		additionalTextEdits: buildStdlibImportEdit(document, alias, importPath),
+		sortText: `1_${alias}`,
+	};
 }
 
 function innermostScope(report: AnalysisReport, offset: number) {
@@ -513,6 +686,25 @@ const STD_MODULE_EXPORTS: Record<string, StdModuleSymbolSpec[]> = {
 	],
 };
 
+function stdModuleSymbols(importPath: string): ImportedSymbolList | null {
+	if (!STD_MODULE_EXPORTS[importPath]) return null;
+	const builtins = STD_MODULE_EXPORTS[importPath].map((item, index) => ({
+		id: -100 - index,
+		name: item.name,
+		kind: item.kind,
+		scope_id: 0,
+		node_id: 0,
+		span: { start: 0, end: 0 },
+		visibility: 'public' as const,
+		signature: item.signature,
+		doc: item.doc ?? null,
+		parameter_names: item.parameter_names ?? null,
+		import_path: null,
+	})) as ImportedSymbolList;
+	builtins.__path = importPath;
+	return builtins;
+}
+
 async function resolveImportedMemberSymbol(
 	document: TextDocumentModel,
 	report: AnalysisReport,
@@ -538,23 +730,7 @@ async function getImportedModuleSymbols(document: TextDocumentModel, symbol: Sym
 	const importPath = symbol.import_path;
 	if (!importPath) return null;
 
-	if (STD_MODULE_EXPORTS[importPath]) {
-		const builtins = STD_MODULE_EXPORTS[importPath].map((item, index) => ({
-			id: -100 - index,
-			name: item.name,
-			kind: item.kind,
-			scope_id: 0,
-			node_id: 0,
-			span: { start: 0, end: 0 },
-			visibility: 'public' as const,
-			signature: item.signature,
-			doc: item.doc ?? null,
-			parameter_names: item.parameter_names ?? null,
-			import_path: null,
-		})) as ImportedSymbolList;
-		builtins.__path = importPath;
-		return builtins;
-	}
+	if (STD_MODULE_EXPORTS[importPath]) return stdModuleSymbols(importPath);
 
 	const containingPath = filePathFromUri(document.uri);
 	const resolvedPath = resolveImportSpecifier(importPath, containingPath);
@@ -621,6 +797,56 @@ function pickExistingImportPath(base: string): string | null {
 		}
 	}
 	return null;
+}
+
+function buildStdlibImportEdit(document: TextDocumentModel, alias: string, importPath: string): TextEdit[] {
+	const text = document.getText();
+	const importLine = `const ${alias} = import("${importPath}");\n`;
+	if (text.includes(importLine.trim())) return [];
+
+	const offset = importInsertionOffset(text);
+	const position = document.positionAt(offset);
+	return [TextEdit.insert(position, importLine)];
+}
+
+function importInsertionOffset(text: string): number {
+	const importLine = /^(?:let|const)\s+[A-Za-z_\x80-\u{10FFFF}][A-Za-z0-9_\x80-\u{10FFFF}]*\s*=\s*import\(".*"\);\s*$/u;
+	let offset = 0;
+	let index = 0;
+	const lines = text.split('\n');
+
+	while (index < lines.length) {
+		const line = lines[index];
+		const trimmed = line.trim();
+		const lineLength = line.length + 1;
+
+		if (trimmed === '') {
+			offset += lineLength;
+			index += 1;
+			continue;
+		}
+
+		if (trimmed.startsWith('///')) {
+			break;
+		}
+
+		if (trimmed.startsWith('//') || trimmed.startsWith('/*')) {
+			offset += lineLength;
+			index += 1;
+			continue;
+		}
+
+		break;
+	}
+
+	while (index < lines.length) {
+		const line = lines[index];
+		if (!importLine.test(line.trim())) break;
+		offset += line.length + 1;
+		index += 1;
+	}
+
+	return offset;
 }
 
 function renderDoc(doc: string): string {
